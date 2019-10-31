@@ -1,18 +1,18 @@
 <?php
 /**
- * Copyright (C) 2018 SLiCK-303
+ * Copyright (C) 2019 SLiCK-303
  *
  * NOTICE OF LICENSE
  *
  * This source file is subject to the Academic Free License (AFL 3.0)
  * that is bundled with this package in the file LICENSE.md.
  * It is also available through the world-wide-web at this URL:
- * http://opensource.org/licenses/afl-3.0.php
+ * https://opensource.org/licenses/afl-3.0.php
  *
  * @package    sendreviewrequest
  * @author     SLiCK-303 <slick_303@hotmail.com>
- * @copyright  2018 SLiCK-303
- * @license    http://opensource.org/licenses/afl-3.0.php  Academic Free License (AFL 3.0)
+ * @copyright  2019 SLiCK-303
+ * @license    Academic Free License (AFL 3.0)
 **/
 
 if (!defined('_TB_VERSION_')) {
@@ -24,9 +24,11 @@ class SendReviewRequest extends Module
 	public function __construct()
 	{
 		$this->name = 'sendreviewrequest';
-		$this->version = '3.2.4';
+		$this->version = '3.3.2';
 		$this->author = 'SLiCK-303';
 		$this->tab = 'emailing';
+		$this->tb_min_version = '1.0.0';
+		$this->tb_versions_compliancy = '>= 1.0.0';
 		$this->need_instance = 0;
 
 		$this->conf_keys = [
@@ -36,6 +38,8 @@ class SendReviewRequest extends Module
 			'SEND_REVW_REQUEST_COLUMNS',
 			'SEND_REVW_REQUEST_DAYS',
 			'SEND_REVW_REQUEST_OLD',
+			'SEND_REVW_REQUEST_ACTION',
+			'SEND_REVW_REQUEST_NEWS'
 		];
 
 		$this->bootstrap = true;
@@ -53,43 +57,29 @@ class SendReviewRequest extends Module
 
 	public function install()
 	{
-		if (!parent::install() ||
-			!$this->registerHook('header') ||
-			!Configuration::updateValue('SEND_REVW_REQUEST_STATE', '5,4') ||
-			!Configuration::updateValue('SEND_REVW_REQUEST_GROUP', '3') ||
-			!Configuration::updateValue('SEND_REVW_REQUEST_NUMBER', 8) ||
-			!Configuration::updateValue('SEND_REVW_REQUEST_COLUMNS', 2) ||
-			!Configuration::updateValue('SEND_REVW_REQUEST_DAYS', 7) ||
-			!Configuration::updateValue('SEND_REVW_REQUEST_OLD', 30) ||
-			!Db::getInstance()->execute('
-				CREATE TABLE '._DB_PREFIX_.'log_srr_email (
-				`id_log_email` int(11) NOT NULL AUTO_INCREMENT,
-				`id_customer` int(11) NOT NULL,
-				`id_order` int(11) NOT NULL,
-				`date_add` datetime NOT NULL,
-				PRIMARY KEY (`id_log_email`),
-				INDEX `id_order`(`id_order`),
-				INDEX `date_add`(`date_add`)
-			) ENGINE='._MYSQL_ENGINE_)
-		) {
-			return false;
-		}
-		return true;
+		return (
+			parent::install() &&
+			$this->registerHooks() &&
+			$this->insertConfiguration() &&
+			$this->createTable()
+		);
 	}
 
 	public function uninstall()
 	{
-		foreach ($this->conf_keys as $key) {
-			Configuration::deleteByName($key);
-		}
-
-		Configuration::deleteByName('SEND_REVW_REQUEST_SECURE_KEY');
-
-		$this->unregisterHook('header');
-
-		Db::getInstance()->execute('DROP TABLE '._DB_PREFIX_.'log_srr_email');
-
+		$this->dropTable();
+		$this->deleteConfiguration(true);
+		$this->unregisterHooks();
 		return parent::uninstall();
+	}
+
+	public function reset()
+	{
+		$this->deleteConfiguration(false);
+		$this->unregisterHooks();
+		$this->registerHooks();
+		$this->insertConfiguration();
+		return true;
 	}
 
 	public function getContent()
@@ -188,7 +178,7 @@ class SendReviewRequest extends Module
 	{
 		return $content;
 	}
-	
+
 	private function sendReviewRequest($count = false)
 	{
 		$conf = Configuration::getMultiple([
@@ -198,6 +188,8 @@ class SendReviewRequest extends Module
 			'SEND_REVW_REQUEST_COLUMNS',
 			'SEND_REVW_REQUEST_DAYS',
 			'SEND_REVW_REQUEST_OLD',
+			'SEND_REVW_REQUEST_ACTION',
+			'SEND_REVW_REQUEST_NEWS'
 		]);
 
 		$order_state = implode(',', (array) $conf['SEND_REVW_REQUEST_STATE']);
@@ -206,15 +198,22 @@ class SendReviewRequest extends Module
 		$number_columns = (int) $conf['SEND_REVW_REQUEST_COLUMNS'];
 		$days = (int) $conf['SEND_REVW_REQUEST_DAYS'];
 		$old = (int) $conf['SEND_REVW_REQUEST_OLD'];
+		$revws_act = (int) $conf['SEND_REVW_REQUEST_ACTION'];
+		$newsletter = (int) $conf['SEND_REVW_REQUEST_NEWS'];
+		if ($revws_act == 1) {
+			$revws_action = 'review_created';
+		} else {
+			$revws_action = 'review_approved';
+		}
 		$url = Tools::getCurrentUrlProtocolPrefix();
 
 		$email_logs = $this->getLogsEmail();
 
 		$sql = '
-			SELECT DISTINCT c.id_customer, c.id_shop, c.id_lang, c.firstname, c.lastname, c.email, o.id_order, o.current_state
+			SELECT c.id_customer, c.id_shop, c.id_lang, c.firstname, c.lastname, c.email, c.newsletter, o.id_order, o.current_state
 			FROM '._DB_PREFIX_.'customer c
-			LEFT JOIN '._DB_PREFIX_.'customer_group cg ON (c.id_customer = cg.id_customer)
-			LEFT JOIN '._DB_PREFIX_.'orders o ON (c.id_customer = o.id_customer)
+			LEFT JOIN '._DB_PREFIX_.'customer_group cg ON c.id_customer = cg.id_customer
+			LEFT JOIN '._DB_PREFIX_.'orders o ON c.id_customer = o.id_customer
 			WHERE o.valid = 1
 			AND cg.id_group IN ('.$customer_group.')
 			AND o.current_state IN ('.$order_state.')
@@ -223,11 +222,15 @@ class SendReviewRequest extends Module
 		$sql .= Shop::addSqlRestriction(Shop::SHARE_CUSTOMER, 'c');
 
 		if (!empty($days)) {
-			$sql .= ' AND DATE_FORMAT(o.date_add, \'%Y-%m-%d\') <= DATE_SUB(CURDATE(), INTERVAL '.$days.' DAY)';
+			$sql .= " AND DATE_FORMAT(o.date_upd, '%Y-%m-%d') < DATE_SUB(CURDATE(), INTERVAL $days DAY)";
 		}
 
 		if (!empty($old)) {
-			$sql .= ' AND DATE_FORMAT(o.date_add, \'%Y-%m-%d\') >= DATE_SUB(CURDATE(), INTERVAL '.$old.' DAY)';
+			$sql .= " AND DATE_FORMAT(o.date_upd, '%Y-%m-%d') > DATE_SUB(CURDATE(), INTERVAL $old DAY)";
+		}
+
+		if ($newsletter == 1) {
+			$sql .= ' AND c.newsletter = 1';
 		}
 
 		if (!empty($email_logs)) {
@@ -286,25 +289,57 @@ class SendReviewRequest extends Module
 					$products_list .= '</table></td>';
 				}
 
-				$template_vars = [
-					'{email}'     => $email['email'],
-					'{lastname}'  => $email['lastname'],
-					'{firstname}' => $email['firstname'],
-					'{products}'  => $this->formatProductForEmail($products_list)
-				];
+				// Trigger the Krona Action
+				if (Module::isEnabled('genzo_krona') && Module::isEnabled('revws')) {
+					$gk_params = [
+						'module_name' => 'revws',
+						'action_name' => $revws_action,
+						'id_customer' => (int)$email['id_customer'],
+					];
+					$action = Hook::exec('displayKronaActionPoints', $gk_params, null, true, false);
 
-				Mail::Send(
-					(int)$id_lang,
-					'post_review',
-					Mail::l('Send your reviews', $id_lang),
-					$template_vars,
-					$email['email'],
-					$email['firstname'].' '.$email['lastname'],
-					null,
-					null,
-					null,
-					null,
-					dirname(__FILE__).'/mails/');
+					$template_vars = [
+						'{email}'     => $email['email'],
+						'{lastname}'  => $email['lastname'],
+						'{firstname}' => $email['firstname'],
+						'{products}'  => $this->formatProductForEmail($products_list),
+						'{points}'    => $action['genzo_krona']['points'],
+					];
+
+					Mail::Send(
+						(int)$id_lang,
+						'post_review_krona',
+						Mail::l('Send your reviews', $id_lang),
+						$template_vars,
+						$email['email'],
+						$email['firstname'].' '.$email['lastname'],
+						null,
+						null,
+						null,
+						null,
+						dirname(__FILE__).'/mails/');
+				} else {
+					$template_vars = [
+						'{email}'     => $email['email'],
+						'{lastname}'  => $email['lastname'],
+						'{firstname}' => $email['firstname'],
+						'{products}'  => $this->formatProductForEmail($products_list),
+					];
+
+					Mail::Send(
+						(int)$id_lang,
+						'post_review',
+						Mail::l('Send your reviews', $id_lang),
+						$template_vars,
+						$email['email'],
+						$email['firstname'].' '.$email['lastname'],
+						null,
+						null,
+						null,
+						null,
+						dirname(__FILE__).'/mails/');
+				}
+
 
 				$this->logEmail((int)$email['id_order'], (int)$email['id_customer']);
 			}
@@ -315,25 +350,6 @@ class SendReviewRequest extends Module
 	{
 		Context::getContext()->link = new Link(); //when this is call by cron context is not init
 		$this->sendReviewRequest();
-	}
-
-	public function renderStats()
-	{
-		$stats = Db::getInstance(_PS_USE_SQL_SLAVE_)->executeS('
-			SELECT DATE_FORMAT(date_add, \'%Y-%m-%d\') date_stat, COUNT(id_log_email) nb
-			FROM '._DB_PREFIX_.'log_srr_email
-			WHERE date_add >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-			GROUP BY DATE_FORMAT(date_add, \'%Y-%m-%d\')
-		');
-
-		$stats_array = [];
-		foreach ($stats as $stat) {
-			$stats_array[$stat['date_stat']][1]['nb'] = (int)$stat['nb'];
-		}
-
-		$this->context->smarty->assign(['stats_array' => $stats_array]);
-
-		return $this->display(__FILE__, 'stats.tpl');
 	}
 
 	public function hookHeader()
@@ -363,9 +379,28 @@ class SendReviewRequest extends Module
 					})
 				</script>';
 			}
-		
+
 			return $html;
 		}
+	}
+
+	public function renderStats()
+	{
+		$stats = Db::getInstance(_PS_USE_SQL_SLAVE_)->executeS('
+			SELECT DATE_FORMAT(date_add, \'%m-%d-%Y\') date_stat, COUNT(id_log_email) nb
+			FROM '._DB_PREFIX_.'log_srr_email
+			WHERE date_add >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+			GROUP BY DATE_FORMAT(date_add, \'%m-%d-%Y\')
+		');
+
+		$stats_array = [];
+		foreach ($stats as $stat) {
+			$stats_array[$stat['date_stat']][1]['nb'] = (int)$stat['nb'];
+		}
+
+		$this->context->smarty->assign(['stats_array' => $stats_array]);
+
+		return $this->display(__FILE__, 'stats.tpl');
 	}
 
 	public function renderForm()
@@ -389,110 +424,153 @@ class SendReviewRequest extends Module
 
 		$cron_info = '';
 		if (Shop::getContext() === Shop::CONTEXT_SHOP) {
-			$cron_info = $this->l('Define the settings and paste the following URL in the crontab, or call it manually on a daily basis:').'<br /><b>'.$this->context->shop->getBaseURL().'modules/sendreviewrequest/cron.php?secure_key='.Configuration::get('SEND_REVW_REQUEST_SECURE_KEY').'</b>';
+			$cron_info = $this->l('Define the settings and paste the following URL in the crontab, or call it manually on a daily basis:').'<br /><b>'.$this->context->shop->getBaseURL(true,true).'modules/sendreviewrequest/cron.php?secure_key='.Configuration::get('SEND_REVW_REQUEST_SECURE_KEY').'</b>';
 		}
 
 		$fields_form_1 = [
 			'form' => [
 				'legend' => [
-					'title' => $this->l('Information'),
-					'icon'  => 'icon-cogs',
+					'title' => $this->l('Cron Information'),
+					'icon'  => 'icon-info',
 				],
 				'description' => $cron_info,
 			],
 		];
 
+		$inputs[] = [
+			'type'     => 'checkbox',
+			'label'    => $this->l('Order State'),
+			'name'     => 'SEND_REVW_REQUEST_STATE',
+			'hint'     => $this->l('Orders need to be in this state/s for the email to be sent'),
+			'multiple' => true,
+			'values'   => [
+				'query' => $orderStates,
+				'id'    => 'id_order_state',
+				'name'  => 'name',
+			],
+			'expand'   => (count($orderStates) > 10) ? [
+				'print_total' => count($orderStates),
+				'default'     => 'show',
+				'show'        => ['text' => $this->l('Show'), 'icon' => 'plus-sign-alt'],
+				'hide'        => ['text' => $this->l('Hide'), 'icon' => 'minus-sign-alt'],
+			] : null,
+		];
+		$inputs[] = [
+			'type'     => 'text',
+			'label'    => $this->l('Number of products'),
+			'name'     => 'SEND_REVW_REQUEST_NUMBER',
+			'hint'     => $this->l('Set the number of products you would like to display in the email (0 = all)'),
+		];
+		$inputs[] = [
+			'type'     => 'radio',
+			'label'    => $this->l('Columns'),
+			'name'     => 'SEND_REVW_REQUEST_COLUMNS',
+			'hint'     => $this->l('Select the number of columns of products to display in the email'),
+			'values'   => [
+				[
+					'id'    => '1column',
+					'value' => 1,
+					'label' => $this->l('1 column'),
+				],
+				[
+					'id'    => '2columns',
+					'value' => 2,
+					'label' => $this->l('2 columns'),
+				],
+			],
+		];
+		$inputs[] = [
+			'type'     => 'text',
+			'label'    => $this->l('Send after'),
+			'name'     => 'SEND_REVW_REQUEST_DAYS',
+			'hint'     => $this->l('Send request AFTER order is this old (0 = now)'),
+			'suffix'   => $this->l('day(s)'),
+		];
+		$inputs[] = [
+			'type'     => 'text',
+			'label'    => $this->l('Send before'),
+			'name'     => 'SEND_REVW_REQUEST_OLD',
+			'hint'     => $this->l('Send request BEFORE order is this old (0 = forever)'),
+			'suffix'   => $this->l('day(s)'),
+		];
+		$inputs[] = [
+			'type'     => 'checkbox',
+			'label'    => $this->l('Group access'),
+			'name'     => 'SEND_REVW_REQUEST_GROUP',
+			'hint'     => $this->l('Select the group/s you want to send emails to'),
+			'multiple' => true,
+			'values'   => [
+				'query' => $groups,
+				'id'    => 'id_group',
+				'name'  => 'name',
+			],
+			'expand'   => (count($groups) > 3) ? [
+				'print_total' => count($groups),
+				'default'     => 'show',
+				'show'        => ['text' => $this->l('Show'), 'icon' => 'plus-sign-alt'],
+				'hide'        => ['text' => $this->l('Hide'), 'icon' => 'minus-sign-alt'],
+			] : null,
+		];
+		$inputs[] = [
+			'type'    => 'switch',
+			'label'   => $this->l('Newsletter subscription'),
+			'name'    => 'SEND_REVW_REQUEST_NEWS',
+			'hint'    => $this->l('Send emails to newletter subscribers only'),
+			'values'  => [
+				[
+					'id'      => 'active_on',
+					'value'   => 1,
+					'label'   => $this->l('Yes'),
+				],
+				[
+					'id'      => 'active_off',
+					'value'   => 0,
+					'label'   => $this->l('No'),
+				],
+			],
+		];
+		if (Module::isEnabled('genzo_krona') && Module::isEnabled('revws')) {
+			$inputs[] = [
+				'type'    => 'radio',
+				'label'   => $this->l('Krona revws action'),
+				'name'    => 'SEND_REVW_REQUEST_ACTION',
+				'hint'    => $this->l('Select which Revws action to use for Krona'),
+				'values'  => [
+					[
+						'id'    => 'review_created',
+						'value' => 1,
+						'label' => $this->l('review_created'),
+					],
+					[
+						'id'    => 'review_approved',
+						'value' => 2,
+						'label' => $this->l('review_approved'),
+					],
+				],
+			];
+		}
+
 		$fields_form_2 = [
 			'form' => [
 				'legend' => [
-					'title' => $this->l('E-Mails to send'),
+					'title' => $this->l('Settings'),
 					'icon'  => 'icon-cogs',
 				],
-				'input' => [
-					[
-						'type'     => 'checkbox',
-						'label'    => $this->l('Order State'),
-						'name'     => 'SEND_REVW_REQUEST_STATE',
-						'hint'     => $this->l('Orders need to be in this state/s for the email to be sent'),
-						'multiple' => true,
-						'values'   => [
-							'query' => $orderStates,
-							'id'    => 'id_order_state',
-							'name'  => 'name',
-						],
-						'expand'   => (count($orderStates) > 10) ? [
-							'print_total' => count($orderStates),
-							'default'     => 'show',
-							'show'        => ['text' => $this->l('Show'), 'icon' => 'plus-sign-alt'],
-							'hide'        => ['text' => $this->l('Hide'), 'icon' => 'minus-sign-alt'],
-						] : null,
-					],
-					[
-						'type'    => 'text',
-						'label'   => $this->l('Number of products'),
-						'name'    => 'SEND_REVW_REQUEST_NUMBER',
-						'hint'    => $this->l('Set the number of products you would like to display in the email (0 = all)'),
-					],
-					[
-						'type'    => 'radio',
-						'label'   => $this->l('Columns'),
-						'name'    => 'SEND_REVW_REQUEST_COLUMNS',
-						'hint'    => $this->l('Select the number of columns of products to display in the email'),
-						'values'  => [
-							[
-								'id'    => '1column',
-								'value' => 1,
-								'label' => $this->l('1 column'),
-							],
-							[
-								'id'    => '2columns',
-								'value' => 2,
-								'label' => $this->l('2 columns'),
-							],
-						],
-					],
-					[
-						'type'    => 'text',
-						'label'   => $this->l('Send after'),
-						'name'    => 'SEND_REVW_REQUEST_DAYS',
-						'hint'    => $this->l('Send request AFTER order is this old (0 = now)'),
-						'suffix'  => $this->l('day(s)'),
-					],
-					[
-						'type'    => 'text',
-						'label'   => $this->l('Send before'),
-						'name'    => 'SEND_REVW_REQUEST_OLD',
-						'hint'    => $this->l('Send request BEFORE order is this old (0 = forever)'),
-						'suffix'  => $this->l('day(s)'),
-					],
-					[
-						'type'     => 'checkbox',
-						'label'    => $this->l('Group access'),
-						'name'     => 'SEND_REVW_REQUEST_GROUP',
-						'hint'     => $this->l('Select the group/s you want to send emails to'),
-						'multiple' => true,
-						'values'   => [
-							'query' => $groups,
-							'id'    => 'id_group',
-							'name'  => 'name',
-						],
-						'expand'   => (count($groups) > 3) ? [
-							'print_total' => count($groups),
-							'default'     => 'show',
-							'show'        => ['text' => $this->l('Show'), 'icon' => 'plus-sign-alt'],
-							'hide'        => ['text' => $this->l('Hide'), 'icon' => 'minus-sign-alt'],
-						] : null,
-					],
-					[
-						'type'    => 'desc',
-						'name'    => '',
-						'text'    => sprintf($this->l('Next process will send: %d e-mail(s)'), $r1),
-					],
-				],
+				'input'  => $inputs,
 				'submit' => [
 					'title' => $this->l('Save'),
 					'class' => 'btn btn-default pull-right',
 				],
+			],
+		];
+
+		$fields_form_3 = [
+			'form' => [
+				'legend' => [
+					'title' => $this->l('E-Mails to send'),
+					'icon'  => 'icon-envelope',
+				],
+				'description' => sprintf($this->l('Next process will send: %d e-mail(s)'), $r1),
 			],
 		];
 
@@ -515,17 +593,19 @@ class SendReviewRequest extends Module
 		$vars['SEND_REVW_REQUEST_COLUMNS'] = (int) Configuration::get('SEND_REVW_REQUEST_COLUMNS');
 		$vars['SEND_REVW_REQUEST_DAYS'] = (int) Configuration::get('SEND_REVW_REQUEST_DAYS');
 		$vars['SEND_REVW_REQUEST_OLD'] = (int) Configuration::get('SEND_REVW_REQUEST_OLD');
+		$vars['SEND_REVW_REQUEST_ACTION'] = (int) Configuration::get('SEND_REVW_REQUEST_ACTION');
+		$vars['SEND_REVW_REQUEST_NEWS'] = (int) Configuration::get('SEND_REVW_REQUEST_NEWS');
 
 		// Order Status
 		$order_state = explode(',', Configuration::get('SEND_REVW_REQUEST_STATE'));
 		foreach ($order_state as $id) {
-		    $vars['SEND_REVW_REQUEST_STATE_'.$id] = true;
+			$vars['SEND_REVW_REQUEST_STATE_'.$id] = true;
 		}
 
 		// Groups
 		$group = explode(',', Configuration::get('SEND_REVW_REQUEST_GROUP'));
 		foreach ($group as $id) {
-		    $vars['SEND_REVW_REQUEST_GROUP_'.$id] = true;
+			$vars['SEND_REVW_REQUEST_GROUP_'.$id] = true;
 		}
 
 		$helper->tpl_vars = [
@@ -537,7 +617,61 @@ class SendReviewRequest extends Module
 		return $helper->generateForm([
 			$fields_form_1,
 			$fields_form_2,
+			$fields_form_3,
 		]);
 	}
 
+	private function registerHooks()
+	{
+		return (
+			$this->registerHook('header')
+		);
+	}
+
+	private function unregisterHooks()
+	{
+		$this->unregisterHook('header');
+	}
+
+	private function insertConfiguration()
+	{
+		return (
+			Configuration::updateValue('SEND_REVW_REQUEST_STATE', '5,4') &&
+			Configuration::updateValue('SEND_REVW_REQUEST_GROUP', '3') &&
+			Configuration::updateValue('SEND_REVW_REQUEST_NUMBER', 8) &&
+			Configuration::updateValue('SEND_REVW_REQUEST_COLUMNS', 2) &&
+			Configuration::updateValue('SEND_REVW_REQUEST_DAYS', 7) &&
+			Configuration::updateValue('SEND_REVW_REQUEST_OLD', 30) &&
+			Configuration::updateValue('SEND_REVW_REQUEST_ACTION', 1) &&
+			Configuration::updateValue('SEND_REVW_REQUEST_NEWS', 1)
+		);
+	}
+
+	private function deleteConfiguration($all=false)
+	{
+		foreach ($this->conf_keys as $key) {
+			Configuration::deleteByName($key);
+		}
+		if ($all) {
+			Configuration::deleteByName('SEND_REVW_REQUEST_SECURE_KEY');
+		}
+	}
+
+	private function createTable()
+	{
+		return Db::getInstance()->execute('
+			CREATE TABLE '._DB_PREFIX_.'log_srr_email (
+			`id_log_email` int(11) NOT NULL AUTO_INCREMENT,
+			`id_customer` int(11) NOT NULL,
+			`id_order` int(11) NOT NULL,
+			`date_add` datetime NOT NULL,
+			PRIMARY KEY (`id_log_email`),
+			INDEX `id_order`(`id_order`),
+			INDEX `date_add`(`date_add`)
+		) ENGINE='._MYSQL_ENGINE_);
+	}
+
+	private function dropTable() {
+		Db::getInstance()->execute('DROP TABLE '._DB_PREFIX_.'log_srr_email');
+	}
 }
